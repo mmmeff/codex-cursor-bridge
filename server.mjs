@@ -20,11 +20,15 @@ import { fileURLToPath } from 'node:url';
 
 import {
   loadState,
+  saveState,
   runSetupWizard,
   printStartupCard,
   shouldRunWizard,
   repoDirOf,
+  copyToClipboard,
+  openCursor,
 } from './lib/setup.mjs';
+import { startNgrokTunnel } from './lib/tunnel.mjs';
 
 const PKG_VERSION = await loadPackageVersion();
 
@@ -58,26 +62,84 @@ const MODEL_ALIASES = ['gpt-5.5', 'gpt-5', 'gpt-4o', 'gpt-4', 'gpt-4-turbo', 'gp
 
 const UA = `${ORIGINATOR}/${CLIENT_VERSION} (${platformLabel()}) bridge`;
 
-// First-run setup wizard, plus startup card every time.
-{
-  const state = await loadState();
-  if (shouldRunWizard({ state, forceSetup: args.setup, noSetup: args['no-setup'] })) {
-    await runSetupWizard({
-      port: PORT,
-      host: HOST,
-      authPath: AUTH_PATH,
-      model: ALLOWED_MODEL,
-      version: PKG_VERSION,
-      repoDir: repoDirOf(import.meta.url),
-    });
-  }
-  printStartupCard({
+// First-run setup wizard. The wizard may persist a tunnel preference + an
+// auth_token to state.json; we read it back after.
+const initialState = await loadState();
+const wizardRanThisInvocation = shouldRunWizard({
+  state: initialState,
+  forceSetup: args.setup,
+  noSetup: args['no-setup'],
+});
+if (wizardRanThisInvocation) {
+  await runSetupWizard({
     port: PORT,
     host: HOST,
     authPath: AUTH_PATH,
     model: ALLOWED_MODEL,
     version: PKG_VERSION,
+    repoDir: repoDirOf(import.meta.url),
   });
+}
+const state = await loadState();
+
+// Tunnel mode: spawn ngrok and use the public URL as the public-facing base
+// URL we print in the startup card. CLI flag wins over state; state wins over
+// the off-by-default.
+const tunnelOn = args.tunnel === true || (!args['no-tunnel'] && state.tunnel === true);
+
+// Auth token: required ONLY when tunnel mode is on (we don't want to break
+// existing localhost-only users). Stored in state.json so Cursor doesn't need
+// re-pasting on every restart.
+const AUTH_TOKEN = tunnelOn ? await ensureAuthToken(state) : null;
+
+let tunnel = null;
+if (tunnelOn) {
+  try {
+    tunnel = await startNgrokTunnel({ port: PORT });
+    process.on('SIGTERM', () => tunnel?.stop());
+    process.on('SIGINT', () => {
+      tunnel?.stop();
+      process.exit(0);
+    });
+  } catch (e) {
+    process.stderr.write(`\nFailed to start ngrok tunnel: ${e.message}\n`);
+    if (e.code === 'NGROK_NOT_FOUND') {
+      process.stderr.write('Install ngrok: https://ngrok.com/download (or `brew install --cask ngrok`)\n');
+    } else if (e.code === 'NGROK_NO_AUTHTOKEN') {
+      process.stderr.write('Configure your ngrok authtoken: `ngrok config add-authtoken <YOUR_TOKEN>`\n');
+      process.stderr.write('Get one (free) at https://dashboard.ngrok.com/get-started/your-authtoken\n');
+    }
+    process.exit(1);
+  }
+}
+
+printStartupCard({
+  port: PORT,
+  host: HOST,
+  authPath: AUTH_PATH,
+  model: ALLOWED_MODEL,
+  version: PKG_VERSION,
+  publicUrl: tunnel?.url,
+  authToken: AUTH_TOKEN,
+});
+
+// Right after the wizard, if tunnel mode was just enabled, do the side
+// effects we promised: copy the public URL to clipboard, open Cursor, so the
+// user can paste-and-go.
+if (wizardRanThisInvocation && tunnel?.url) {
+  if (copyToClipboard(tunnel.url)) {
+    process.stdout.write(`\nCopied ${tunnel.url} to clipboard.\n`);
+  }
+  if (openCursor()) {
+    process.stdout.write('Opened Cursor.\n');
+  }
+}
+
+async function ensureAuthToken(currentState) {
+  if (currentState.auth_token) return currentState.auth_token;
+  const token = 'sk-bridge-' + crypto.randomBytes(20).toString('hex');
+  await saveState({ ...currentState, auth_token: token });
+  return token;
 }
 
 function parseCli(argv) {
@@ -91,6 +153,8 @@ function parseCli(argv) {
         model: { type: 'string', short: 'm' },
         setup: { type: 'boolean' },
         'no-setup': { type: 'boolean' },
+        tunnel: { type: 'boolean' },
+        'no-tunnel': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -120,6 +184,11 @@ Options:
       --host <host>          Bind address (default: 127.0.0.1)
   -a, --auth-path <path>     Codex auth file (default: ~/.codex/auth.json)
   -m, --model <id>           Upstream model id (default: gpt-5.5)
+      --tunnel               Expose the bridge through an ngrok tunnel so
+                             Cursor's cloud backend can reach it (required
+                             for Cursor BYOK to actually route through here)
+      --no-tunnel            Force localhost-only even if the wizard saved a
+                             tunnel preference
       --setup                Re-run the first-run setup wizard
       --no-setup             Skip the wizard even on first run (for daemons)
   -h, --help                 Show this help
@@ -664,6 +733,21 @@ const server = http.createServer(async (req, res) => {
   // /healthz is the LaunchAgent/monit-style poll target; logging it would
   // drown out everything else.
   const silent = p === '/healthz';
+
+  // Auth gate. When AUTH_TOKEN is set (tunnel mode), require
+  // `Authorization: Bearer <token>` on /v1/* routes. /healthz stays open so
+  // ngrok and monitors can probe liveness without the secret.
+  if (AUTH_TOKEN && p.startsWith('/v1/')) {
+    const hdr = req.headers.authorization || '';
+    const m = /^Bearer\s+(.+)$/i.exec(hdr);
+    if (!m || m[1] !== AUTH_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'invalid or missing bearer token', type: 'codex_bridge_unauthorized' } }));
+      if (!silent) logRequest({ method: req.method, path: p || '/', status: 401, ms: performance.now() - start, extra: 'auth' });
+      return;
+    }
+  }
+
   try {
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
