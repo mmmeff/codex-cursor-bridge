@@ -51,7 +51,10 @@ const ORIGINATOR = process.env.CODEX_ORIGINATOR || 'codex_cli_rs';
 // currently accepts. The bridge aliases popular OpenAI model names to it so
 // existing clients that hard-code "gpt-4o" etc. still work.
 const ALLOWED_MODEL = args.model ?? process.env.CODEX_MODEL ?? 'gpt-5.5';
-const MODEL_ALIASES = ['gpt-5.5', 'gpt-5', 'gpt-5-codex', 'gpt-4o', 'gpt-4', 'gpt-4-turbo', 'gpt-4o-mini'];
+// Note: the ChatGPT-plan Codex backend currently only accepts "gpt-5.5";
+// "gpt-5-codex" is explicitly rejected. The other names are aliases that
+// existing clients send — we translate them all to ALLOWED_MODEL upstream.
+const MODEL_ALIASES = ['gpt-5.5', 'gpt-5', 'gpt-4o', 'gpt-4', 'gpt-4-turbo', 'gpt-4o-mini'];
 
 const UA = `${ORIGINATOR}/${CLIENT_VERSION} (${platformLabel()}) bridge`;
 
@@ -169,31 +172,48 @@ async function readAuth() {
 }
 
 async function writeAuth(auth) {
-  await fs.writeFile(AUTH_PATH, JSON.stringify(auth, null, 2));
+  // Atomic write + restrictive mode so we don't downgrade Codex's 0600 file
+  // or leave a half-written file behind if we get killed mid-write.
+  const tmp = `${AUTH_PATH}.tmp-${process.pid}`;
+  await fs.writeFile(tmp, JSON.stringify(auth, null, 2), { mode: 0o600 });
+  await fs.rename(tmp, AUTH_PATH);
 }
 
+// Coalesce concurrent 401s into a single refresh attempt. Without this, N
+// in-flight requests that all hit a stale token would each fire their own
+// refresh and race to write auth.json.
+let inflightRefresh = null;
 async function refreshAuth(auth) {
-  const refresh_token = auth.tokens?.refresh_token;
-  if (!refresh_token) throw new Error("no refresh_token; run 'codex login'");
-  const body = new URLSearchParams({
-    grant_type: 'refresh_token',
-    client_id: CLIENT_ID,
-    refresh_token,
-    scope: 'openid profile email offline_access',
+  if (inflightRefresh) return inflightRefresh;
+  inflightRefresh = (async () => {
+    const refresh_token = auth.tokens?.refresh_token;
+    if (!refresh_token) throw new Error("no refresh_token; run 'codex login'");
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: CLIENT_ID,
+      refresh_token,
+      scope: 'openid profile email offline_access',
+    });
+    const res = await fetch(REFRESH_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    if (!res.ok) {
+      const errText = (await res.text().catch(() => '')).slice(0, 200);
+      throw new Error(`refresh failed: ${res.status} ${errText}`);
+    }
+    const j = await res.json();
+    auth.tokens.access_token = j.access_token || auth.tokens.access_token;
+    if (j.refresh_token) auth.tokens.refresh_token = j.refresh_token;
+    if (j.id_token) auth.tokens.id_token = j.id_token;
+    auth.last_refresh = new Date().toISOString();
+    await writeAuth(auth);
+    return auth;
+  })().finally(() => {
+    inflightRefresh = null;
   });
-  const res = await fetch(REFRESH_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-  if (!res.ok) throw new Error(`refresh failed: ${res.status} ${await res.text()}`);
-  const j = await res.json();
-  auth.tokens.access_token = j.access_token || auth.tokens.access_token;
-  if (j.refresh_token) auth.tokens.refresh_token = j.refresh_token;
-  if (j.id_token) auth.tokens.id_token = j.id_token;
-  auth.last_refresh = new Date().toISOString();
-  await writeAuth(auth);
-  return auth;
+  return inflightRefresh;
 }
 
 function upstreamHeaders(auth) {
@@ -279,8 +299,8 @@ function chatToResponses(req) {
   if (req.parallel_tool_calls != null) out.parallel_tool_calls = req.parallel_tool_calls;
   if (req.temperature != null) out.temperature = req.temperature;
   if (req.top_p != null) out.top_p = req.top_p;
-  if (req.max_tokens != null) out.max_output_tokens = req.max_tokens;
-  if (req.max_completion_tokens != null) out.max_output_tokens = req.max_completion_tokens;
+  // Intentionally NOT forwarding max_tokens / max_completion_tokens / max_output_tokens.
+  // The ChatGPT-plan Codex backend rejects them with "Unsupported parameter" 400s.
   return out;
 }
 
@@ -533,10 +553,21 @@ function modelsResponse() {
 
 // ---------- HTTP plumbing ----------
 
+const MAX_REQUEST_BYTES = 8 * 1024 * 1024; // 8 MiB — generous for Cursor's largest payloads
+
 function readJSON(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let total = 0;
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > MAX_REQUEST_BYTES) {
+        req.destroy();
+        reject(new Error(`request body exceeds ${MAX_REQUEST_BYTES} bytes`));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => {
       const text = Buffer.concat(chunks).toString('utf8') || '{}';
       try {
