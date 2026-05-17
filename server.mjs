@@ -201,6 +201,7 @@ async function refreshAuth(auth) {
     });
     if (!res.ok) {
       const errText = (await res.text().catch(() => '')).slice(0, 200);
+      logEvent('red', `token refresh failed: ${res.status}`);
       throw new Error(`refresh failed: ${res.status} ${errText}`);
     }
     const j = await res.json();
@@ -209,6 +210,7 @@ async function refreshAuth(auth) {
     if (j.id_token) auth.tokens.id_token = j.id_token;
     auth.last_refresh = new Date().toISOString();
     await writeAuth(auth);
+    logEvent('cyan', 'refreshed access token via auth.openai.com');
     return auth;
   })().finally(() => {
     inflightRefresh = null;
@@ -384,6 +386,17 @@ async function handleChatCompletions(req, res) {
   const upstreamBody = chatToResponses(body);
   upstreamBody.stream = true;
   const requestedModel = body.model || ALLOWED_MODEL;
+  const msgCount = Array.isArray(body.messages) ? body.messages.length : 0;
+  const toolCount = Array.isArray(body.tools) ? body.tools.length : 0;
+  // Per-request metadata stashed on `req` so the outer router can log it.
+  req._cbMeta = {
+    model: requestedModel,
+    msgs: msgCount,
+    tools: toolCount,
+    mode: wantStream ? 'stream' : 'single',
+    chunks: 0,
+    bytes: 0,
+  };
 
   let up;
   try {
@@ -416,7 +429,11 @@ async function handleChatCompletions(req, res) {
       if (!d || typeof d !== 'object') continue;
       const t = d.type;
       if (t === 'response.output_text.delta') {
-        if (d.delta) res.write(chunk(id, requestedModel, { content: d.delta }));
+        if (d.delta) {
+          res.write(chunk(id, requestedModel, { content: d.delta }));
+          req._cbMeta.chunks += 1;
+          req._cbMeta.bytes += Buffer.byteLength(d.delta);
+        }
       } else if (t === 'response.output_item.added' && d.item?.type === 'function_call') {
         const itemId = d.item.id;
         const entry = { index: toolIdx++, id: d.item.call_id || itemId, name: d.item.name || '', args: '' };
@@ -447,6 +464,8 @@ async function handleChatCompletions(req, res) {
               ],
             }),
           );
+          req._cbMeta.chunks += 1;
+          req._cbMeta.bytes += Buffer.byteLength(d.delta);
         }
       } else if (t === 'response.completed') {
         const reason = d.response?.incomplete_details?.reason;
@@ -503,8 +522,10 @@ async function handleChatCompletions(req, res) {
       },
     ],
   };
+  const payload = JSON.stringify(out);
+  req._cbMeta.bytes = Buffer.byteLength(payload);
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(out));
+  res.end(payload);
 }
 
 async function handleResponsesPassthrough(req, res) {
@@ -555,6 +576,53 @@ function modelsResponse() {
 
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024; // 8 MiB — generous for Cursor's largest payloads
 
+// ---------- request logging ----------
+//
+// One short line per request so users can verify the bridge is actually being
+// hit. Errors go red, redirects/4xx yellow, 2xx normal. /healthz is silenced
+// (LaunchAgents and monit-style watchers poll it).
+
+const ANSI = {
+  reset: '\x1b[0m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[36m',
+};
+const LOG_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
+const tint = (k, s) => (LOG_COLOR ? `${ANSI[k]}${s}${ANSI.reset}` : s);
+
+function nowHMS() {
+  const d = new Date();
+  return d.toTimeString().slice(0, 8);
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${(n / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function statusColor(s) {
+  if (s >= 500) return 'red';
+  if (s >= 400) return 'yellow';
+  if (s >= 300) return 'cyan';
+  return 'green';
+}
+
+function logRequest({ method, path: p, status, ms, extra = '' }) {
+  const tag = tint(statusColor(status), String(status));
+  const dur = `${ms.toFixed(0)}ms`;
+  process.stdout.write(
+    `${tint('dim', nowHMS())} ${method.padEnd(4)} ${p.padEnd(22)} → ${tag} ${tint('dim', dur)}${extra ? ' ' + extra : ''}\n`,
+  );
+}
+
+function logEvent(color, message) {
+  process.stdout.write(`${tint('dim', nowHMS())} ${tint(color, message)}\n`);
+}
+
 function readJSON(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -592,6 +660,10 @@ function respondError(res, status, message) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const p = url.pathname.replace(/\/+$/, '');
+  const start = performance.now();
+  // /healthz is the LaunchAgent/monit-style poll target; logging it would
+  // drown out everything else.
+  const silent = p === '/healthz';
   try {
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -606,7 +678,7 @@ const server = http.createServer(async (req, res) => {
       await handleResponsesPassthrough(req, res);
       return;
     }
-    if (req.method === 'GET' && p === '/healthz') {
+    if (silent) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
       return;
@@ -616,6 +688,20 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     console.error('handler error:', e);
     respondError(res, 500, e.message || String(e));
+  } finally {
+    if (!silent) {
+      const ms = performance.now() - start;
+      const meta = req._cbMeta;
+      let extra = '';
+      if (meta) {
+        const parts = [meta.model, `msgs=${meta.msgs}`];
+        if (meta.tools) parts.push(`tools=${meta.tools}`);
+        if (meta.mode === 'stream') parts.push(`stream chunks=${meta.chunks}`);
+        if (meta.bytes) parts.push(fmtBytes(meta.bytes));
+        extra = parts.join(' ');
+      }
+      logRequest({ method: req.method, path: p || '/', status: res.statusCode, ms, extra });
+    }
   }
 });
 
