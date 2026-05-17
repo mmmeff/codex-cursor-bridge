@@ -18,6 +18,14 @@ import crypto from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
+import {
+  loadState,
+  runSetupWizard,
+  printStartupCard,
+  shouldRunWizard,
+  repoDirOf,
+} from './lib/setup.mjs';
+
 const PKG_VERSION = await loadPackageVersion();
 
 const args = parseCli(process.argv.slice(2));
@@ -47,6 +55,28 @@ const MODEL_ALIASES = ['gpt-5.5', 'gpt-5', 'gpt-5-codex', 'gpt-4o', 'gpt-4', 'gp
 
 const UA = `${ORIGINATOR}/${CLIENT_VERSION} (${platformLabel()}) bridge`;
 
+// First-run setup wizard, plus startup card every time.
+{
+  const state = await loadState();
+  if (shouldRunWizard({ state, forceSetup: args.setup, noSetup: args['no-setup'] })) {
+    await runSetupWizard({
+      port: PORT,
+      host: HOST,
+      authPath: AUTH_PATH,
+      model: ALLOWED_MODEL,
+      version: PKG_VERSION,
+      repoDir: repoDirOf(import.meta.url),
+    });
+  }
+  printStartupCard({
+    port: PORT,
+    host: HOST,
+    authPath: AUTH_PATH,
+    model: ALLOWED_MODEL,
+    version: PKG_VERSION,
+  });
+}
+
 function parseCli(argv) {
   try {
     const { values } = parseArgs({
@@ -56,6 +86,8 @@ function parseCli(argv) {
         host: { type: 'string' },
         'auth-path': { type: 'string', short: 'a' },
         model: { type: 'string', short: 'm' },
+        setup: { type: 'boolean' },
+        'no-setup': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -85,6 +117,8 @@ Options:
       --host <host>          Bind address (default: 127.0.0.1)
   -a, --auth-path <path>     Codex auth file (default: ~/.codex/auth.json)
   -m, --model <id>           Upstream model id (default: gpt-5.5)
+      --setup                Re-run the first-run setup wizard
+      --no-setup             Skip the wizard even on first run (for daemons)
   -h, --help                 Show this help
   -v, --version              Show version
 
@@ -554,8 +588,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`codex-cursor-bridge listening at http://${HOST}:${PORT}/v1`);
-  console.log(`  auth source: ${AUTH_PATH}`);
-  console.log(`  upstream model: ${ALLOWED_MODEL}`);
-});
+server.listen(PORT, HOST);

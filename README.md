@@ -60,17 +60,22 @@ If you've already run `codex login`, this is the whole thing:
 npx codex-cursor-bridge
 ```
 
-You should see:
+The **first** time you run it you'll see an interactive setup wizard that:
 
-```
-codex-cursor-bridge listening at http://127.0.0.1:7711/v1
-  auth source: /Users/you/.codex/auth.json
-  upstream model: gpt-5.5
-```
+1. Checks prerequisites — Node version, the Codex CLI, `~/.codex/auth.json`,
+   your ChatGPT plan, and an actual upstream probe.
+2. Offers to install a LaunchAgent (macOS) so the proxy auto-starts at login.
+3. Offers to wire it into Cursor — copies the base URL to your clipboard,
+   opens Cursor, and prints the exact fields to paste.
 
-Smoke test it:
+Every subsequent start prints a compact "Cursor BYOK setup" card with the
+URL and a 5-step checklist, so you never have to remember the magic string.
+
+Re-run the wizard at any time with `--setup`; daemons skip it automatically
+(no TTY → no prompts) and you can force-skip with `--no-setup`.
 
 ```bash
+# smoke test once it's running
 curl http://127.0.0.1:7711/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"say hi"}],"stream":false}'
@@ -106,9 +111,14 @@ codex-cursor-bridge [options]
       --host <host>          Bind address (default: 127.0.0.1)
   -a, --auth-path <path>     Codex auth file (default: ~/.codex/auth.json)
   -m, --model <id>           Upstream model id (default: gpt-5.5)
+      --setup                Re-run the first-run setup wizard
+      --no-setup             Skip the wizard even on first run (for daemons)
   -h, --help                 Show help
   -v, --version              Show version
 ```
+
+Setup state lives at `~/.codex-cursor-bridge/state.json`. Delete it (or run
+`--setup`) to walk through the wizard again.
 
 Flags take precedence over environment variables. Example: bind on a different
 port temporarily:
