@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // codex-cursor-bridge
 // Expose a ChatGPT-Pro/Plus-backed Codex Responses API as an OpenAI-compatible
 // chat-completions endpoint, so tools like Cursor can use it for "Bring Your
@@ -14,10 +15,24 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { parseArgs } from 'node:util';
+import { fileURLToPath } from 'node:url';
 
-const PORT = Number(process.env.CODEX_BRIDGE_PORT || 7711);
-const HOST = process.env.CODEX_BRIDGE_HOST || '127.0.0.1';
-const AUTH_PATH = process.env.CODEX_AUTH_PATH || path.join(os.homedir(), '.codex', 'auth.json');
+const PKG_VERSION = await loadPackageVersion();
+
+const args = parseCli(process.argv.slice(2));
+if (args.help) {
+  printHelp();
+  process.exit(0);
+}
+if (args.version) {
+  console.log(PKG_VERSION);
+  process.exit(0);
+}
+
+const PORT = Number(args.port ?? process.env.CODEX_BRIDGE_PORT ?? 7711);
+const HOST = args.host ?? process.env.CODEX_BRIDGE_HOST ?? '127.0.0.1';
+const AUTH_PATH = args['auth-path'] ?? process.env.CODEX_AUTH_PATH ?? path.join(os.homedir(), '.codex', 'auth.json');
 const UPSTREAM = 'https://chatgpt.com/backend-api/codex/responses';
 const REFRESH_URL = 'https://auth.openai.com/oauth/token';
 const CLIENT_ID = process.env.CODEX_CLIENT_ID || 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -27,10 +42,80 @@ const ORIGINATOR = process.env.CODEX_ORIGINATOR || 'codex_cli_rs';
 // "gpt-5.5" is the only model the ChatGPT-subscription Codex backend
 // currently accepts. The bridge aliases popular OpenAI model names to it so
 // existing clients that hard-code "gpt-4o" etc. still work.
-const ALLOWED_MODEL = process.env.CODEX_MODEL || 'gpt-5.5';
+const ALLOWED_MODEL = args.model ?? process.env.CODEX_MODEL ?? 'gpt-5.5';
 const MODEL_ALIASES = ['gpt-5.5', 'gpt-5', 'gpt-5-codex', 'gpt-4o', 'gpt-4', 'gpt-4-turbo', 'gpt-4o-mini'];
 
 const UA = `${ORIGINATOR}/${CLIENT_VERSION} (${platformLabel()}) bridge`;
+
+function parseCli(argv) {
+  try {
+    const { values } = parseArgs({
+      args: argv,
+      options: {
+        port: { type: 'string', short: 'p' },
+        host: { type: 'string' },
+        'auth-path': { type: 'string', short: 'a' },
+        model: { type: 'string', short: 'm' },
+        help: { type: 'boolean', short: 'h' },
+        version: { type: 'boolean', short: 'v' },
+      },
+      allowPositionals: false,
+      strict: true,
+    });
+    return values;
+  } catch (e) {
+    console.error(`error: ${e.message}\n`);
+    printHelp(process.stderr);
+    process.exit(2);
+  }
+}
+
+function printHelp(stream = process.stdout) {
+  stream.write(`codex-cursor-bridge v${PKG_VERSION}
+
+Run a localhost OpenAI-compatible proxy backed by your ChatGPT subscription
+(via the Codex CLI's auth at ~/.codex/auth.json).
+
+Usage:
+  codex-cursor-bridge [options]
+  npx codex-cursor-bridge [options]
+
+Options:
+  -p, --port <port>          Port to listen on (default: 7711)
+      --host <host>          Bind address (default: 127.0.0.1)
+  -a, --auth-path <path>     Codex auth file (default: ~/.codex/auth.json)
+  -m, --model <id>           Upstream model id (default: gpt-5.5)
+  -h, --help                 Show this help
+  -v, --version              Show version
+
+Environment overrides (CLI flags take precedence):
+  CODEX_BRIDGE_PORT, CODEX_BRIDGE_HOST, CODEX_AUTH_PATH, CODEX_MODEL,
+  CODEX_CLIENT_VERSION, CODEX_ORIGINATOR, CODEX_CLIENT_ID
+
+Endpoints once running:
+  GET  /healthz
+  GET  /v1/models
+  POST /v1/chat/completions
+  POST /v1/responses
+
+Prerequisites:
+  - A ChatGPT Pro or Plus subscription
+  - The Codex CLI installed and logged in (\`codex login\`)
+  - Node.js 20+
+
+Docs: https://github.com/mmmeff/codex-cursor-bridge
+`);
+}
+
+async function loadPackageVersion() {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(await fs.readFile(path.join(here, 'package.json'), 'utf8'));
+    return pkg.version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
 
 function platformLabel() {
   const plat = process.platform === 'darwin' ? 'Macintosh; macOS' : process.platform === 'linux' ? 'Linux' : process.platform;

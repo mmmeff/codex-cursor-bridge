@@ -52,12 +52,12 @@ Verify the prerequisite:
 test -f ~/.codex/auth.json && echo "auth present" || echo "run: codex login"
 ```
 
-## Install
+## Quick start
+
+If you've already run `codex login`, this is the whole thing:
 
 ```bash
-git clone https://github.com/mmmeff/codex-cursor-bridge.git
-cd codex-cursor-bridge
-node server.mjs
+npx codex-cursor-bridge
 ```
 
 You should see:
@@ -76,7 +76,50 @@ curl http://127.0.0.1:7711/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"say hi"}],"stream":false}'
 ```
 
+> **Not on npm yet?** Until the package is published you can pull the CLI
+> straight from this repo with the same command shape:
+> ```bash
+> npx github:mmmeff/codex-cursor-bridge
+> ```
+
+## Install
+
+A few other ways to run it:
+
+```bash
+# Global install (then just run `codex-cursor-bridge`)
+npm install -g codex-cursor-bridge
+codex-cursor-bridge
+
+# From a clone
+git clone https://github.com/mmmeff/codex-cursor-bridge.git
+cd codex-cursor-bridge
+node server.mjs
+```
+
+### CLI flags
+
+```
+codex-cursor-bridge [options]
+
+  -p, --port <port>          Port to listen on (default: 7711)
+      --host <host>          Bind address (default: 127.0.0.1)
+  -a, --auth-path <path>     Codex auth file (default: ~/.codex/auth.json)
+  -m, --model <id>           Upstream model id (default: gpt-5.5)
+  -h, --help                 Show help
+  -v, --version              Show version
+```
+
+Flags take precedence over environment variables. Example: bind on a different
+port temporarily:
+
+```bash
+npx codex-cursor-bridge --port 8088
+```
+
 ### Run it on login (macOS)
+
+From a clone of the repo:
 
 ```bash
 npm run install-launchd        # or: bash scripts/install-launchd.sh
@@ -134,17 +177,18 @@ systemctl --user enable --now codex-cursor-bridge
 
 ## Configuration
 
-All optional, via env vars:
+CLI flags (above) cover the common knobs. Everything else is via env vars,
+which is also how the LaunchAgent / systemd unit set values:
 
-| Variable                | Default                         | Meaning                                          |
-| ----------------------- | ------------------------------- | ------------------------------------------------ |
-| `CODEX_BRIDGE_PORT`     | `7711`                          | TCP port to listen on                            |
-| `CODEX_BRIDGE_HOST`     | `127.0.0.1`                     | Bind address                                     |
-| `CODEX_AUTH_PATH`       | `~/.codex/auth.json`            | Path to the Codex auth file                      |
-| `CODEX_MODEL`           | `gpt-5.5`                       | Real upstream model                              |
-| `CODEX_CLIENT_VERSION`  | `0.131.0`                       | `version` header sent upstream                   |
-| `CODEX_ORIGINATOR`      | `codex_cli_rs`                  | `originator` header sent upstream                |
-| `CODEX_CLIENT_ID`       | `app_EMoamEEZ73f0CkXaXp7hrann`  | OAuth client_id used during token refresh        |
+| Variable                | CLI flag         | Default                         | Meaning                                     |
+| ----------------------- | ---------------- | ------------------------------- | ------------------------------------------- |
+| `CODEX_BRIDGE_PORT`     | `--port`         | `7711`                          | TCP port to listen on                       |
+| `CODEX_BRIDGE_HOST`     | `--host`         | `127.0.0.1`                     | Bind address                                |
+| `CODEX_AUTH_PATH`       | `--auth-path`    | `~/.codex/auth.json`            | Path to the Codex auth file                 |
+| `CODEX_MODEL`           | `--model`        | `gpt-5.5`                       | Real upstream model                         |
+| `CODEX_CLIENT_VERSION`  | _(none)_         | `0.131.0`                       | `version` header sent upstream              |
+| `CODEX_ORIGINATOR`      | _(none)_         | `codex_cli_rs`                  | `originator` header sent upstream           |
+| `CODEX_CLIENT_ID`       | _(none)_         | `app_EMoamEEZ73f0CkXaXp7hrann`  | OAuth client_id used during token refresh   |
 
 ## Endpoints
 

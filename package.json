@@ -31,5 +31,11 @@
     "codex",
     "proxy",
     "byok"
+  ],
+  "files": [
+    "server.mjs",
+    "scripts/",
+    "README.md",
+    "LICENSE"
   ]
 }
