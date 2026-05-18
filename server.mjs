@@ -66,10 +66,10 @@ const ORIGINATOR = process.env.CODEX_ORIGINATOR || 'codex_cli_rs';
 //
 // Unknown model names are REJECTED with 400 instead of silently rewritten.
 const BRIDGE_MODEL_MAP = {
-  'bridge-pro': 'gpt-5.5',
-  'bridge-fast': 'gpt-5.4',
-  'bridge-codex': 'gpt-5.3-codex',
-  'bridge-mini': 'gpt-5.2',
+  'bridge-pro': { upstream: 'gpt-5.5', tagline: 'flagship — best for hard tasks' },
+  'bridge-fast': { upstream: 'gpt-5.4', tagline: 'quicker, slightly smaller' },
+  'bridge-codex': { upstream: 'gpt-5.3-codex', tagline: 'Codex-tuned variant' },
+  'bridge-mini': { upstream: 'gpt-5.2', tagline: 'cheapest / fastest' },
 };
 const BRIDGE_MODELS = Object.keys(BRIDGE_MODEL_MAP);
 
@@ -77,7 +77,7 @@ const BRIDGE_MODELS = Object.keys(BRIDGE_MODEL_MAP);
 // caller sent something we don't support. Callers should respond 400 on null.
 function resolveUpstreamModel(requested) {
   if (typeof requested !== 'string') return null;
-  return BRIDGE_MODEL_MAP[requested] ?? null;
+  return BRIDGE_MODEL_MAP[requested]?.upstream ?? null;
 }
 
 function unsupportedModelMessage(requested) {
@@ -107,6 +107,7 @@ if (wizardRanThisInvocation) {
     host: HOST,
     authPath: AUTH_PATH,
     bridgeModels: BRIDGE_MODELS,
+    bridgeModelMap: BRIDGE_MODEL_MAP,
     version: PKG_VERSION,
     repoDir: repoDirOf(import.meta.url),
   });
@@ -148,7 +149,7 @@ printStartupCard({
   port: PORT,
   host: HOST,
   authPath: AUTH_PATH,
-  bridgeModels: BRIDGE_MODELS,
+  bridgeModelMap: BRIDGE_MODEL_MAP,
   version: PKG_VERSION,
   publicUrl: tunnel?.url,
   authToken: AUTH_TOKEN,
