@@ -1,6 +1,6 @@
 {
   "name": "codex-cursor-bridge",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Local OpenAI-compatible proxy that routes Cursor (or any OpenAI-API client) through the Codex CLI's ChatGPT-subscription auth — use your ChatGPT Pro/Plus plan instead of paying for separate OpenAI API credits.",
   "type": "module",
   "main": "server.mjs",
