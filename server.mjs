@@ -112,19 +112,38 @@ const ORIGINATOR = process.env.CODEX_ORIGINATOR || 'codex_cli_rs';
 // cleanly to BYOK.
 //
 // Unknown model names are REJECTED with 400 instead of silently rewritten.
+// Per-alias upstream metadata. `reasoning` and `fast` are baked into the
+// alias name so users can pick a depth/speed tradeoff straight from Cursor's
+// model picker without parameter UI.
+//
+// `reasoning.effort` accepts low/medium/high/xhigh (probed empirically).
+// `fast` maps to `service_tier: priority` on the wire — upstream accepts
+// it for ChatGPT-Pro accounts but appears to normalize back to "auto" in
+// the response, so treat fast as a best-effort hint rather than a guarantee.
 const BRIDGE_MODEL_MAP = {
-  'bridge-pro': { upstream: 'gpt-5.5', tagline: 'flagship — best for hard tasks' },
-  'bridge-fast': { upstream: 'gpt-5.4', tagline: 'quicker, slightly smaller' },
-  'bridge-codex': { upstream: 'gpt-5.3-codex', tagline: 'Codex-tuned variant' },
-  'bridge-mini': { upstream: 'gpt-5.2', tagline: 'cheapest / fastest' },
+  // gpt-5.5 (flagship) — six reasoning × fast combinations.
+  'bridge-pro-medium':       { upstream: 'gpt-5.5',       reasoning: 'medium', tagline: 'medium reasoning' },
+  'bridge-pro-high':         { upstream: 'gpt-5.5',       reasoning: 'high',   tagline: 'high reasoning (recommended)' },
+  'bridge-pro-xhigh':        { upstream: 'gpt-5.5',       reasoning: 'xhigh',  tagline: 'extra-high reasoning' },
+  'bridge-pro-medium-fast':  { upstream: 'gpt-5.5',       reasoning: 'medium', fast: true, tagline: 'medium reasoning · fast (best-effort)' },
+  'bridge-pro-high-fast':    { upstream: 'gpt-5.5',       reasoning: 'high',   fast: true, tagline: 'high reasoning · fast (best-effort)' },
+  'bridge-pro-xhigh-fast':   { upstream: 'gpt-5.5',       reasoning: 'xhigh',  fast: true, tagline: 'extra-high reasoning · fast (best-effort)' },
+  // Other ChatGPT-Pro Codex models keep their single-alias form. Reasoning
+  // defaults to whatever upstream chooses (typically `medium`) unless the
+  // caller passes a `reasoning` field directly.
+  'bridge-fast':             { upstream: 'gpt-5.4',         tagline: 'quicker, slightly smaller' },
+  'bridge-codex':            { upstream: 'gpt-5.3-codex',   tagline: 'Codex-tuned variant' },
+  'bridge-mini':             { upstream: 'gpt-5.2',         tagline: 'cheapest / fastest' },
 };
 const BRIDGE_MODELS = Object.keys(BRIDGE_MODEL_MAP);
 
-// Returns the upstream model id for a client-facing alias, or null if the
-// caller sent something we don't support. Callers should respond 400 on null.
+// Returns the full upstream descriptor for a client-facing alias, or null if
+// the caller sent something we don't support. Callers should respond 400 on
+// null. Use `.upstream` for the model name; `.reasoning` / `.fast` for the
+// optional knobs to inject.
 function resolveUpstreamModel(requested) {
   if (typeof requested !== 'string') return null;
-  return BRIDGE_MODEL_MAP[requested]?.upstream ?? null;
+  return BRIDGE_MODEL_MAP[requested] ?? null;
 }
 
 function unsupportedModelMessage(requested) {
@@ -211,9 +230,18 @@ printStartupCard({
 // silently undone within seconds. We warn loudly and refuse to silently
 // proceed; the user has to fully quit Cursor and re-run.
 //
-// Stale aliases from earlier releases (when we used `bridge-gpt-*` names)
-// are explicitly cleaned up so they don't pile up in Cursor's picker.
-const LEGACY_BRIDGE_NAMES = ['bridge-gpt-5.5', 'bridge-gpt-5.4', 'bridge-gpt-5.3-codex', 'bridge-gpt-5.2'];
+// Stale aliases from earlier releases get cleaned up so they don't pile up
+// in Cursor's picker:
+//   - `bridge-gpt-*` (pre-1.0 substring-hijacked names)
+//   - `bridge-pro`   (1.0/1.0.1 flagship; now split into 6 reasoning/fast
+//                     variants in 2.0)
+const LEGACY_BRIDGE_NAMES = [
+  'bridge-gpt-5.5',
+  'bridge-gpt-5.4',
+  'bridge-gpt-5.3-codex',
+  'bridge-gpt-5.2',
+  'bridge-pro',
+];
 if (tunnel?.url && cursorStateDbExists()) {
   const baseUrl = `${tunnel.url}/v1`;
   const cursorAlive = isCursorRunning();
@@ -446,7 +474,7 @@ function normalizeContentByRole(content, role) {
   });
 }
 
-function chatToResponses(req, upstreamModel) {
+function chatToResponses(req, modelSpec) {
   const messages = Array.isArray(req.messages) ? req.messages : [];
   const sys = [];
   const input = [];
@@ -489,12 +517,14 @@ function chatToResponses(req, upstreamModel) {
     });
   }
   const out = {
-    model: upstreamModel,
+    model: modelSpec.upstream,
     instructions: sys.length ? sys.join('\n\n') : 'You are a helpful assistant.',
     input,
     stream: true,
     store: false,
   };
+  if (modelSpec.reasoning) out.reasoning = { effort: modelSpec.reasoning };
+  if (modelSpec.fast) out.service_tier = 'priority';
   if (Array.isArray(req.tools) && req.tools.length) {
     out.tools = req.tools.map((t) => {
       if (t.type === 'function' && t.function) {
@@ -519,7 +549,7 @@ function chatToResponses(req, upstreamModel) {
 //   - Function-call and function-call-output items pass through.
 //   - Tools, tool_choice, temperature, top_p, parallel_tool_calls, user are
 //     forwarded as-is. max_tokens et al. are still stripped (upstream rejects).
-function responsesShapeToUpstream(body, upstreamModel) {
+function responsesShapeToUpstream(body, modelSpec) {
   const items = Array.isArray(body.input) ? body.input : [];
   const sys = [];
   const out = [];
@@ -544,7 +574,7 @@ function responsesShapeToUpstream(body, upstreamModel) {
     });
   }
   const upstream = {
-    model: upstreamModel,
+    model: modelSpec.upstream,
     instructions:
       typeof body.instructions === 'string' && body.instructions.length
         ? body.instructions + (sys.length ? '\n\n' + sys.join('\n\n') : '')
@@ -555,6 +585,8 @@ function responsesShapeToUpstream(body, upstreamModel) {
     stream: true,
     store: false,
   };
+  if (modelSpec.reasoning) upstream.reasoning = { effort: modelSpec.reasoning };
+  if (modelSpec.fast) upstream.service_tier = 'priority';
   if (Array.isArray(body.tools)) upstream.tools = body.tools;
   if (body.tool_choice) upstream.tool_choice = body.tool_choice;
   if (body.parallel_tool_calls != null) upstream.parallel_tool_calls = body.parallel_tool_calls;
@@ -646,8 +678,8 @@ async function handleChatCompletions(req, res) {
   const wantStream = body.stream !== false; // default to streaming
   // Reject unknown models with a clear 400 — the bridge namespace is a
   // strict whitelist, no silent rewrites.
-  const upstreamModel = resolveUpstreamModel(body.model);
-  if (!upstreamModel) {
+  const modelSpec = resolveUpstreamModel(body.model);
+  if (!modelSpec) {
     respondError(res, 400, unsupportedModelMessage(body.model));
     return;
   }
@@ -657,8 +689,8 @@ async function handleChatCompletions(req, res) {
   // re-translating from messages we don't have.
   const isResponsesShape = Array.isArray(body.input) && !Array.isArray(body.messages);
   const upstreamBody = isResponsesShape
-    ? responsesShapeToUpstream(body, upstreamModel)
-    : chatToResponses(body, upstreamModel);
+    ? responsesShapeToUpstream(body, modelSpec)
+    : chatToResponses(body, modelSpec);
   upstreamBody.stream = true;
   const requestedModel = body.model;
   const msgCount = isResponsesShape
@@ -820,12 +852,14 @@ async function handleResponsesPassthrough(req, res) {
       `${tint('dim', nowHMS())} ${tint('magenta', 'DEBUG /v1/responses in:')} ${JSON.stringify(body).slice(0, 800)}\n`,
     );
   }
-  const upstreamModel = resolveUpstreamModel(body.model);
-  if (!upstreamModel) {
+  const modelSpec = resolveUpstreamModel(body.model);
+  if (!modelSpec) {
     respondError(res, 400, unsupportedModelMessage(body.model));
     return;
   }
-  body.model = upstreamModel;
+  body.model = modelSpec.upstream;
+  if (modelSpec.reasoning) body.reasoning = { effort: modelSpec.reasoning };
+  if (modelSpec.fast) body.service_tier = 'priority';
   if (!body.instructions) body.instructions = 'You are a helpful assistant.';
   body.stream = true;
   let up;
