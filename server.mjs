@@ -376,6 +376,29 @@ function upstreamHeaders(auth) {
 
 // ---------- chat/completions <-> responses translators ----------
 
+// The Codex Responses API is strict about content-part types:
+//   role: 'user'      → 'input_text' / 'input_image'
+//   role: 'assistant' → 'output_text' / 'refusal'
+// Sending the wrong one produces 400s like
+//   "Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'."
+function normalizeContentByRole(content, role) {
+  const textType = role === 'assistant' ? 'output_text' : 'input_text';
+  const parts = Array.isArray(content) ? content : [content];
+  return parts.map((p) => {
+    if (typeof p === 'string') return { type: textType, text: p };
+    if (p == null) return { type: textType, text: '' };
+    if (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text') {
+      return { type: textType, text: p.text ?? '' };
+    }
+    if (p.type === 'refusal') return p;
+    if (p.type === 'image_url') {
+      return { type: 'input_image', image_url: p.image_url?.url ?? p.image_url };
+    }
+    if (p.type === 'input_image' || p.type === 'output_image') return p;
+    return { type: textType, text: typeof p === 'object' ? JSON.stringify(p) : String(p) };
+  });
+}
+
 function chatToResponses(req, upstreamModel) {
   const messages = Array.isArray(req.messages) ? req.messages : [];
   const sys = [];
@@ -406,23 +429,16 @@ function chatToResponses(req, upstreamModel) {
         input.push({
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text: stringOf(m.content) }],
+          content: normalizeContentByRole(m.content, 'assistant'),
         });
       }
       continue;
     }
-    const contentParts = Array.isArray(m.content)
-      ? m.content.map((p) => {
-          if (typeof p === 'string') return { type: 'input_text', text: p };
-          if (p.type === 'text') return { type: 'input_text', text: p.text };
-          if (p.type === 'image_url') return { type: 'input_image', image_url: p.image_url?.url ?? p.image_url };
-          return { type: 'input_text', text: JSON.stringify(p) };
-        })
-      : [{ type: 'input_text', text: stringOf(m.content) }];
+    const role = m.role === 'user' ? 'user' : 'assistant';
     input.push({
       type: 'message',
-      role: m.role === 'user' ? 'user' : 'assistant',
-      content: contentParts,
+      role,
+      content: normalizeContentByRole(m.content, role),
     });
   }
   const out = {
@@ -449,10 +465,6 @@ function chatToResponses(req, upstreamModel) {
   return out;
 }
 
-function stringOf(c) {
-  return typeof c === 'string' ? c : c == null ? '' : JSON.stringify(c);
-}
-
 // Body the caller already wrote in Responses-API shape (`input` array of
 // role/content items). Sanitize for the upstream Codex Responses endpoint:
 //   - System / developer items get pulled into top-level `instructions`
@@ -474,7 +486,15 @@ function responsesShapeToUpstream(body, upstreamModel) {
       sys.push(typeof it.content === 'string' ? it.content : JSON.stringify(it.content));
       continue;
     }
-    out.push(it);
+    // Normalize content-part types per role. Cursor sometimes sends prior
+    // assistant turns with `input_text` parts which upstream rejects.
+    const role = it.role === 'user' ? 'user' : 'assistant';
+    out.push({
+      ...it,
+      type: it.type ?? 'message',
+      role,
+      content: normalizeContentByRole(it.content, role),
+    });
   }
   const upstream = {
     model: upstreamModel,
@@ -823,6 +843,7 @@ const ANSI = {
   green: '\x1b[32m',
   yellow: '\x1b[33m',
   cyan: '\x1b[36m',
+  magenta: '\x1b[35m',
 };
 const LOG_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
 const tint = (k, s) => (LOG_COLOR ? `${ANSI[k]}${s}${ANSI.reset}` : s);
