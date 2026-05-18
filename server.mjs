@@ -51,14 +51,43 @@ const CLIENT_ID = process.env.CODEX_CLIENT_ID || 'app_EMoamEEZ73f0CkXaXp7hrann';
 const CLIENT_VERSION = process.env.CODEX_CLIENT_VERSION || '0.131.0';
 const ORIGINATOR = process.env.CODEX_ORIGINATOR || 'codex_cli_rs';
 
-// "gpt-5.5" is the only model the ChatGPT-subscription Codex backend
-// currently accepts. The bridge aliases popular OpenAI model names to it so
-// existing clients that hard-code "gpt-4o" etc. still work.
-const ALLOWED_MODEL = args.model ?? process.env.CODEX_MODEL ?? 'gpt-5.5';
-// Note: the ChatGPT-plan Codex backend currently only accepts "gpt-5.5";
-// "gpt-5-codex" is explicitly rejected. The other names are aliases that
-// existing clients send — we translate them all to ALLOWED_MODEL upstream.
-const MODEL_ALIASES = ['gpt-5.5', 'gpt-5', 'gpt-4o', 'gpt-4', 'gpt-4-turbo', 'gpt-4o-mini'];
+// Models the ChatGPT-plan Codex backend actually accepts (probed empirically).
+// Requests using one of these names are forwarded verbatim so the user gets
+// the model they asked for. Anything else gets rewritten to DEFAULT_MODEL,
+// which is what e.g. `bridge-gpt-5.5` and the legacy gpt-4o-style aliases
+// rely on.
+const ACCEPTED_UPSTREAM_MODELS = new Set(['gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex', 'gpt-5.2']);
+const DEFAULT_MODEL = args.model ?? process.env.CODEX_MODEL ?? 'gpt-5.5';
+// Returns the model name to actually send upstream. If the caller asked for
+// something the backend won't accept, fall back to DEFAULT_MODEL.
+function resolveUpstreamModel(requested) {
+  if (requested && ACCEPTED_UPSTREAM_MODELS.has(requested)) return requested;
+  return DEFAULT_MODEL;
+}
+
+// Aliases advertised on /v1/models.
+//
+// Real ChatGPT-Pro models that pass through verbatim:
+//   gpt-5.4, gpt-5.3-codex, gpt-5.2 — work in Cursor BYOK (not hijacked).
+//   gpt-5.5 — works for non-Cursor callers (Aider/Continue/SDK), but Cursor
+//             treats it as one of its own managed models and routes around
+//             BYOK. Use `bridge-gpt-5.5` from Cursor to actually reach it.
+//
+// Pure aliases (rewritten upstream to DEFAULT_MODEL):
+//   bridge-gpt-5.5 — Cursor-safe synonym for gpt-5.5.
+//   gpt-4o, gpt-4, gpt-4-turbo, gpt-4o-mini — backwards-compat for clients
+//     that hard-code these names; you still get DEFAULT_MODEL upstream.
+const MODEL_ALIASES = [
+  'bridge-gpt-5.5',
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.3-codex',
+  'gpt-5.2',
+  'gpt-4o',
+  'gpt-4',
+  'gpt-4-turbo',
+  'gpt-4o-mini',
+];
 
 const UA = `${ORIGINATOR}/${CLIENT_VERSION} (${platformLabel()}) bridge`;
 
@@ -75,7 +104,7 @@ if (wizardRanThisInvocation) {
     port: PORT,
     host: HOST,
     authPath: AUTH_PATH,
-    model: ALLOWED_MODEL,
+    model: DEFAULT_MODEL,
     version: PKG_VERSION,
     repoDir: repoDirOf(import.meta.url),
   });
@@ -117,7 +146,7 @@ printStartupCard({
   port: PORT,
   host: HOST,
   authPath: AUTH_PATH,
-  model: ALLOWED_MODEL,
+  model: DEFAULT_MODEL,
   version: PKG_VERSION,
   publicUrl: tunnel?.url,
   authToken: AUTH_TOKEN,
@@ -352,7 +381,7 @@ function chatToResponses(req) {
     });
   }
   const out = {
-    model: ALLOWED_MODEL,
+    model: resolveUpstreamModel(req.model),
     instructions: sys.length ? sys.join('\n\n') : 'You are a helpful assistant.',
     input,
     stream: true,
@@ -377,6 +406,52 @@ function chatToResponses(req) {
 
 function stringOf(c) {
   return typeof c === 'string' ? c : c == null ? '' : JSON.stringify(c);
+}
+
+// Body the caller already wrote in Responses-API shape (`input` array of
+// role/content items). Sanitize for the upstream Codex Responses endpoint:
+//   - System / developer items get pulled into top-level `instructions`
+//     (the only place upstream accepts a system prompt for ChatGPT-plan auth).
+//   - Function-call and function-call-output items pass through.
+//   - Tools, tool_choice, temperature, top_p, parallel_tool_calls, user are
+//     forwarded as-is. max_tokens et al. are still stripped (upstream rejects).
+function responsesShapeToUpstream(body) {
+  const items = Array.isArray(body.input) ? body.input : [];
+  const sys = [];
+  const out = [];
+  for (const it of items) {
+    if (!it || typeof it !== 'object') continue;
+    if (it.type === 'function_call' || it.type === 'function_call_output') {
+      out.push(it);
+      continue;
+    }
+    if (it.role === 'system' || it.role === 'developer') {
+      sys.push(typeof it.content === 'string' ? it.content : JSON.stringify(it.content));
+      continue;
+    }
+    out.push(it);
+  }
+  const upstream = {
+    model: resolveUpstreamModel(body.model),
+    instructions:
+      typeof body.instructions === 'string' && body.instructions.length
+        ? body.instructions + (sys.length ? '\n\n' + sys.join('\n\n') : '')
+        : sys.length
+          ? sys.join('\n\n')
+          : 'You are a helpful assistant.',
+    input: out,
+    stream: true,
+    store: false,
+  };
+  if (Array.isArray(body.tools)) upstream.tools = body.tools;
+  if (body.tool_choice) upstream.tool_choice = body.tool_choice;
+  if (body.parallel_tool_calls != null) upstream.parallel_tool_calls = body.parallel_tool_calls;
+  if (body.temperature != null) upstream.temperature = body.temperature;
+  if (body.top_p != null) upstream.top_p = body.top_p;
+  // Intentionally dropped: `user`, `max_tokens`, `max_output_tokens`,
+  // `metadata`, `stream_options`. The ChatGPT-plan Codex backend rejects
+  // these with `"Unsupported parameter: ..."` 400s.
+  return upstream;
 }
 
 // ---------- SSE plumbing ----------
@@ -451,11 +526,25 @@ async function callUpstreamWithRefresh(reqBody) {
 
 async function handleChatCompletions(req, res) {
   const body = await readJSON(req);
+  if (process.env.CODEX_BRIDGE_DEBUG) {
+    process.stdout.write(
+      `${tint('dim', nowHMS())} ${tint('magenta', 'DEBUG chat/completions in:')} ${JSON.stringify(body).slice(0, 800)}\n`,
+    );
+  }
   const wantStream = body.stream !== false; // default to streaming
-  const upstreamBody = chatToResponses(body);
+  // Cursor (and likely future OpenAI SDKs) sends a Responses-API-shaped body
+  // — an `input` array of role/content items, no top-level `messages` — to
+  // the chat/completions URL. Detect that shape and route it without
+  // re-translating from messages we don't have.
+  const isResponsesShape = Array.isArray(body.input) && !Array.isArray(body.messages);
+  const upstreamBody = isResponsesShape ? responsesShapeToUpstream(body) : chatToResponses(body);
   upstreamBody.stream = true;
-  const requestedModel = body.model || ALLOWED_MODEL;
-  const msgCount = Array.isArray(body.messages) ? body.messages.length : 0;
+  const requestedModel = body.model || DEFAULT_MODEL;
+  const msgCount = isResponsesShape
+    ? body.input.length
+    : Array.isArray(body.messages)
+      ? body.messages.length
+      : 0;
   const toolCount = Array.isArray(body.tools) ? body.tools.length : 0;
   // Per-request metadata stashed on `req` so the outer router can log it.
   req._cbMeta = {
@@ -477,6 +566,12 @@ async function handleChatCompletions(req, res) {
 
   if (!up.ok || !up.body) {
     const text = await up.text().catch(() => '');
+    // Always log upstream errors with the body we forwarded — invaluable when
+    // a downstream client sends a shape we don't translate cleanly.
+    process.stdout.write(
+      `${tint('dim', nowHMS())} ${tint('red', `upstream ${up.status}`)} forwarded body: ${JSON.stringify(upstreamBody).slice(0, 600)}\n`,
+    );
+    process.stdout.write(`${tint('dim', '   upstream said:')} ${text.slice(0, 500)}\n`);
     respondError(res, up.status || 500, text || 'upstream error');
     return;
   }
@@ -599,7 +694,12 @@ async function handleChatCompletions(req, res) {
 
 async function handleResponsesPassthrough(req, res) {
   const body = await readJSON(req);
-  body.model = ALLOWED_MODEL;
+  if (process.env.CODEX_BRIDGE_DEBUG) {
+    process.stdout.write(
+      `${tint('dim', nowHMS())} ${tint('magenta', 'DEBUG /v1/responses in:')} ${JSON.stringify(body).slice(0, 800)}\n`,
+    );
+  }
+  body.model = resolveUpstreamModel(body.model);
   if (!body.instructions) body.instructions = 'You are a helpful assistant.';
   body.stream = true;
   let up;
@@ -611,6 +711,10 @@ async function handleResponsesPassthrough(req, res) {
   }
   if (!up.ok || !up.body) {
     const t = await up.text().catch(() => '');
+    process.stdout.write(
+      `${tint('dim', nowHMS())} ${tint('red', `upstream ${up.status}`)} forwarded body: ${JSON.stringify(body).slice(0, 600)}\n`,
+    );
+    process.stdout.write(`${tint('dim', '   upstream said:')} ${t.slice(0, 500)}\n`);
     respondError(res, up.status || 500, t);
     return;
   }
