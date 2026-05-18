@@ -31,6 +31,53 @@ import {
 import { startNgrokTunnel } from './lib/tunnel.mjs';
 import { applyCursorConfig, isCursorRunning, cursorStateDbExists } from './lib/cursor-config.mjs';
 
+// ---------- logging helpers ----------
+//
+// Hoisted up here so the top-level Cursor-auto-config block (and anything
+// else above the route handlers) can use ANSI/tint without hitting a TDZ.
+
+const ANSI = {
+  reset: '\x1b[0m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[36m',
+  magenta: '\x1b[35m',
+};
+const LOG_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
+const tint = (k, s) => (LOG_COLOR ? `${ANSI[k]}${s}${ANSI.reset}` : s);
+
+function nowHMS() {
+  const d = new Date();
+  return d.toTimeString().slice(0, 8);
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${(n / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function statusColor(s) {
+  if (s >= 500) return 'red';
+  if (s >= 400) return 'yellow';
+  if (s >= 300) return 'cyan';
+  return 'green';
+}
+
+function logRequest({ method, path: p, status, ms, extra = '' }) {
+  const tag = tint(statusColor(status), String(status));
+  const dur = `${ms.toFixed(0)}ms`;
+  process.stdout.write(
+    `${tint('dim', nowHMS())} ${method.padEnd(4)} ${p.padEnd(22)} → ${tag} ${tint('dim', dur)}${extra ? ' ' + extra : ''}\n`,
+  );
+}
+
+function logEvent(color, message) {
+  process.stdout.write(`${tint('dim', nowHMS())} ${tint(color, message)}\n`);
+}
+
 const PKG_VERSION = await loadPackageVersion();
 
 const args = parseCli(process.argv.slice(2));
@@ -829,54 +876,6 @@ function modelsResponse() {
 // ---------- HTTP plumbing ----------
 
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024; // 8 MiB — generous for Cursor's largest payloads
-
-// ---------- request logging ----------
-//
-// One short line per request so users can verify the bridge is actually being
-// hit. Errors go red, redirects/4xx yellow, 2xx normal. /healthz is silenced
-// (LaunchAgents and monit-style watchers poll it).
-
-const ANSI = {
-  reset: '\x1b[0m',
-  dim: '\x1b[2m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  cyan: '\x1b[36m',
-  magenta: '\x1b[35m',
-};
-const LOG_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
-const tint = (k, s) => (LOG_COLOR ? `${ANSI[k]}${s}${ANSI.reset}` : s);
-
-function nowHMS() {
-  const d = new Date();
-  return d.toTimeString().slice(0, 8);
-}
-
-function fmtBytes(n) {
-  if (n < 1024) return `${n}B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
-  return `${(n / 1024 / 1024).toFixed(1)}MB`;
-}
-
-function statusColor(s) {
-  if (s >= 500) return 'red';
-  if (s >= 400) return 'yellow';
-  if (s >= 300) return 'cyan';
-  return 'green';
-}
-
-function logRequest({ method, path: p, status, ms, extra = '' }) {
-  const tag = tint(statusColor(status), String(status));
-  const dur = `${ms.toFixed(0)}ms`;
-  process.stdout.write(
-    `${tint('dim', nowHMS())} ${method.padEnd(4)} ${p.padEnd(22)} → ${tag} ${tint('dim', dur)}${extra ? ' ' + extra : ''}\n`,
-  );
-}
-
-function logEvent(color, message) {
-  process.stdout.write(`${tint('dim', nowHMS())} ${tint(color, message)}\n`);
-}
 
 function readJSON(req) {
   return new Promise((resolve, reject) => {
