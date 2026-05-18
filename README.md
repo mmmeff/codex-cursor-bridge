@@ -20,7 +20,7 @@ API.
        │                                │                              │
        │  POST /v1/chat/completions     │  POST /codex/responses       │
        │  Bearer <bridge token>         │  Bearer <codex access token> │
-       │  model: bridge-gpt-5.4         │  model: gpt-5.4              │
+       │  model: bridge-fast            │  model: gpt-5.4              │
        ├───────────────────────────────►├─────────────────────────────►│
        │                                │  Authorization: Bearer ...   │
        │                                │  chatgpt-account-id: ...     │
@@ -36,8 +36,8 @@ API.
 - A passthrough `/v1/responses` if a client speaks the Responses API directly
 - Automatic OAuth refresh against `auth.openai.com` when the access token expires
 - A strict `bridge-*` model namespace mapping to the four real models the
-  ChatGPT-Pro Codex backend currently accepts: `bridge-gpt-5.5`,
-  `bridge-gpt-5.4`, `bridge-gpt-5.3-codex`, `bridge-gpt-5.2`. See
+  ChatGPT-Pro Codex backend currently accepts: `bridge-pro`,
+  `bridge-fast`, `bridge-codex`, `bridge-mini`. See
   [Model aliases](#model-aliases) below.
 - Optional `--tunnel` mode that runs an ngrok tunnel so Cursor's cloud can
   reach the bridge (Cursor BYOK proxies through Cursor's servers, not from
@@ -143,22 +143,28 @@ npx codex-cursor-bridge --port 8088
 
 The bridge exposes a strict whitelist of model names — sending any other
 name (e.g. `gpt-4o`, `gpt-3.5-turbo`, plain `gpt-5.5`) gets a `400` with the
-supported list. The aliases are 1:1 with the four model names the
+supported list. The four aliases map 1:1 to the four model names the
 ChatGPT-Pro Codex backend currently accepts:
 
-| Bridge alias            | Upstream model    | Notes                              |
-| ----------------------- | ----------------- | ---------------------------------- |
-| `bridge-gpt-5.5`        | `gpt-5.5`         | Cursor-safe synonym for gpt-5.5    |
-| `bridge-gpt-5.4`        | `gpt-5.4`         |                                    |
-| `bridge-gpt-5.3-codex`  | `gpt-5.3-codex`   | the Codex-tuned variant            |
-| `bridge-gpt-5.2`        | `gpt-5.2`         | smaller / cheaper                  |
+| Bridge alias    | Upstream model    | Use when…                              |
+| --------------- | ----------------- | -------------------------------------- |
+| `bridge-pro`    | `gpt-5.5`         | flagship — best for hard tasks         |
+| `bridge-fast`   | `gpt-5.4`         | quicker, slightly smaller              |
+| `bridge-codex`  | `gpt-5.3-codex`   | the Codex-tuned variant                |
+| `bridge-mini`   | `gpt-5.2`         | cheapest / fastest                     |
 
-The `bridge-` prefix exists because Cursor's cloud has special handling
-for the bare name `gpt-5.5` — it's one of Cursor's branded SKUs and gets
-routed through their own servers regardless of your BYOK URL, bypassing
-this bridge entirely. Custom names that Cursor doesn't recognize (anything
-with the `bridge-` prefix) are forwarded to your BYOK URL normally. See
-[Cursor specifics](#cursor-specifics) for the full mechanics.
+**Why opaque names instead of `bridge-gpt-5.5` etc.?** Cursor's cloud does
+a substring match on model names — anything containing `gpt-5.5` is treated
+as their premium SKU and routed through their managed service regardless
+of your BYOK URL (the request never reaches this bridge; you see "User
+Provided API Key Rate Limit Exceeded"). Opaque names like `bridge-pro`
+don't match any of Cursor's reserved patterns, so they pass cleanly through
+to BYOK. See [Cursor specifics](#cursor-specifics) for the full mechanics.
+
+> Earlier releases used `bridge-gpt-5.5` etc. Those are no longer accepted.
+> The wizard's auto-config cleans the old names out of Cursor's settings
+> store automatically. If you don't use the wizard, remove them from
+> Cursor → Settings → Models → "Add Model".
 
 ### Run it on login (macOS)
 
@@ -213,9 +219,11 @@ That has two consequences:
 - **Cursor cherry-picks which model names go through BYOK.** Its branded
   premium SKUs (`gpt-5.5`, the Composer family, Claude, etc.) bypass BYOK
   and use Cursor's own routing — you'll see a "User Provided API Key Rate
-  Limit Exceeded" error if you try them. Custom model names that aren't on
-  Cursor's reserved list pass through to the BYOK URL normally. The
-  `bridge-*` aliases all dodge the reserved list.
+  Limit Exceeded" error if you try them. The routing decision uses
+  substring matching: even `bridge-gpt-5.5` would be premium-hijacked
+  because it contains `gpt-5.5`. The bridge's opaque aliases
+  (`bridge-pro`, `bridge-fast`, `bridge-codex`, `bridge-mini`) sidestep
+  this entirely.
 
 ### One-time setup
 
@@ -244,7 +252,7 @@ Then in Cursor:
    (We can't write secrets to Cursor's keychain — this is the one thing
    that stays manual.)
 3. Click **Verify**.
-4. Pick `bridge-gpt-5.5` (or any other `bridge-*` alias) in the model picker.
+4. Pick `bridge-pro` (or any other `bridge-*` alias) in the model picker.
 
 **If you fully quit and reopen Cursor after running the wizard**, the auto-
 configured settings show up. If Cursor was running while the wizard ran, it
@@ -294,7 +302,7 @@ which is also how the LaunchAgent / systemd unit set values:
 
 1. **Model resolution.** Incoming `model` is checked against the
    [`bridge-*` whitelist](#model-aliases). Unknown names get a `400`; known
-   ones are mapped to the upstream-accepted name (e.g. `bridge-gpt-5.4` →
+   ones are mapped to the upstream-accepted name (e.g. `bridge-fast` →
    `gpt-5.4`).
 2. **Auth lookup.** On each request the proxy reads `~/.codex/auth.json`:
    - `tokens.access_token` — short-lived JWT, `chatgpt_plan_type=pro`/`plus`.
@@ -337,7 +345,7 @@ const client = new OpenAI({
   apiKey: 'sk-bridge', // any non-empty value when no --tunnel; else the generated token
 });
 const r = await client.chat.completions.create({
-  model: 'bridge-gpt-5.4',
+  model: 'bridge-fast',
   messages: [{ role: 'user', content: 'hi' }],
 });
 ```
@@ -360,8 +368,8 @@ API key to any non-empty value (or the bridge token when running with
 - **Cursor BYOK URL ≠ localhost.** Cursor's cloud forwards BYOK calls, so
   the bridge needs a public URL (see `--tunnel`). The free ngrok tier
   rotates the URL each restart.
-- **Cursor reserves the bare `gpt-5.5` name.** Use `bridge-gpt-5.5`
-  instead.
+- **Cursor reserves the bare `gpt-5.5` name** (and substring-matches it,
+  so `bridge-gpt-5.5` also gets premium-hijacked). Use `bridge-pro`.
 - **Public exposure with `--tunnel`.** Anyone who learns both the ngrok URL
   and the bridge token can spend your quota. The bridge generates a random
   per-install token, but treat the pair as sensitive.

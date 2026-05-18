@@ -54,18 +54,22 @@ const ORIGINATOR = process.env.CODEX_ORIGINATOR || 'codex_cli_rs';
 
 // The bridge namespace. Every supported client-facing model uses the
 // `bridge-` prefix and maps to one of the four models the ChatGPT-Pro Codex
-// backend currently accepts. The prefix exists because Cursor's cloud
-// hijacks raw OpenAI-flavored names like `gpt-5.5` and routes them around
-// BYOK; the bridge-prefixed aliases pass cleanly through.
+// backend currently accepts.
 //
-// Unknown model names are REJECTED with 400 instead of silently rewritten
-// (clients sending `gpt-4o` etc. were getting back gpt-5.5 outputs without
-// realizing it).
+// We deliberately avoid embedding the upstream model id (especially
+// `gpt-5.5`) inside the alias. Cursor's cloud appears to do a substring
+// match on model names: anything containing `gpt-5.5` gets premium-routed
+// through Cursor's managed service and never reaches our BYOK URL, which
+// surfaces as a misleading "User Provided API Key Rate Limit Exceeded".
+// Names like `bridge-pro` etc. are opaque to Cursor and pass through
+// cleanly to BYOK.
+//
+// Unknown model names are REJECTED with 400 instead of silently rewritten.
 const BRIDGE_MODEL_MAP = {
-  'bridge-gpt-5.5': 'gpt-5.5',
-  'bridge-gpt-5.4': 'gpt-5.4',
-  'bridge-gpt-5.3-codex': 'gpt-5.3-codex',
-  'bridge-gpt-5.2': 'gpt-5.2',
+  'bridge-pro': 'gpt-5.5',
+  'bridge-fast': 'gpt-5.4',
+  'bridge-codex': 'gpt-5.3-codex',
+  'bridge-mini': 'gpt-5.2',
 };
 const BRIDGE_MODELS = Object.keys(BRIDGE_MODEL_MAP);
 
@@ -153,24 +157,43 @@ printStartupCard({
 // When tunnel mode is on, sync Cursor's on-device settings store so the user
 // doesn't have to re-paste a fresh ngrok URL or add each bridge-* model by
 // hand. Best-effort — failures are logged but never fatal.
+//
+// IMPORTANT: Cursor overwrites userAddedModels with its in-memory copy on
+// every refresh. If Cursor is running while we write, our changes are
+// silently undone within seconds. We warn loudly and refuse to silently
+// proceed; the user has to fully quit Cursor and re-run.
+//
+// Stale aliases from earlier releases (when we used `bridge-gpt-*` names)
+// are explicitly cleaned up so they don't pile up in Cursor's picker.
+const LEGACY_BRIDGE_NAMES = ['bridge-gpt-5.5', 'bridge-gpt-5.4', 'bridge-gpt-5.3-codex', 'bridge-gpt-5.2'];
 if (tunnel?.url && cursorStateDbExists()) {
   const baseUrl = `${tunnel.url}/v1`;
-  const result = applyCursorConfig({
-    openAIBaseUrl: baseUrl,
-    addUserAddedModels: BRIDGE_MODELS,
-  });
-  if (result.ok && result.changes.length) {
-    process.stdout.write(`\nUpdated Cursor settings: ${result.changes.join(' · ')}\n`);
-    if (isCursorRunning()) {
-      process.stdout.write(
-        'Cursor is running — fully quit and reopen Cursor (Cmd+Q, then relaunch) so it picks up the new settings.\n',
-      );
-    }
-  } else if (result.ok) {
-    process.stdout.write('\nCursor settings already up to date.\n');
+  const cursorAlive = isCursorRunning();
+  if (cursorAlive) {
+    process.stdout.write(
+      `\n${ANSI.yellow}!! Cursor is currently running — skipping settings sync. !!${ANSI.reset}\n` +
+        `   Cursor wipes user-added BYOK models within seconds of any disk write\n` +
+        `   while it's open. To auto-register the bridge-* aliases:\n` +
+        `     1. Quit Cursor fully (Cmd+Q — not just close the window)\n` +
+        `     2. Restart this bridge (Ctrl+C, then re-run the same command)\n` +
+        `     3. Launch Cursor again; the models will be in "Add Model" already\n` +
+        `   In the meantime add them by hand: Settings → Models → "Add Model" →\n` +
+        `   ${BRIDGE_MODELS.join(', ')}\n`,
+    );
   } else {
-    process.stdout.write(`\nCould not auto-update Cursor settings: ${result.reason}\n`);
-    process.stdout.write('Configure manually using the BYOK card above.\n');
+    const result = applyCursorConfig({
+      openAIBaseUrl: baseUrl,
+      addUserAddedModels: BRIDGE_MODELS,
+      removeUserAddedModels: LEGACY_BRIDGE_NAMES.filter((n) => !BRIDGE_MODELS.includes(n)),
+    });
+    if (result.ok && result.changes.length) {
+      process.stdout.write(`\nUpdated Cursor settings: ${result.changes.join(' · ')}\n`);
+    } else if (result.ok) {
+      process.stdout.write('\nCursor settings already up to date.\n');
+    } else {
+      process.stdout.write(`\nCould not auto-update Cursor settings: ${result.reason}\n`);
+      process.stdout.write('Configure manually using the BYOK card above.\n');
+    }
   }
 }
 
