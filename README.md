@@ -14,11 +14,13 @@ so usage is billed against your ChatGPT subscription rather than the metered
 API.
 
 ```
-   Cursor / curl / any            codex-cursor-bridge                 OpenAI
-   OpenAI client                  (localhost:7711)
+   Cursor cloud / Aider /         codex-cursor-bridge               ChatGPT-Pro
+   any OpenAI client              (localhost:7711 + optional         Codex backend
+                                   ngrok tunnel for Cursor)
        │                                │                              │
        │  POST /v1/chat/completions     │  POST /codex/responses       │
-       │  Bearer <anything>             │  Bearer <codex access token> │
+       │  Bearer <bridge token>         │  Bearer <codex access token> │
+       │  model: bridge-gpt-5.4         │  model: gpt-5.4              │
        ├───────────────────────────────►├─────────────────────────────►│
        │                                │  Authorization: Bearer ...   │
        │                                │  chatgpt-account-id: ...     │
@@ -33,9 +35,17 @@ API.
 - Tool / function calling (translated both ways)
 - A passthrough `/v1/responses` if a client speaks the Responses API directly
 - Automatic OAuth refresh against `auth.openai.com` when the access token expires
-- One model: `gpt-5.5` (the only one the ChatGPT-subscription Codex backend allows).
-  Common names like `gpt-4o`, `gpt-4`, `gpt-4-turbo`, `gpt-4o-mini`, `gpt-5`
-  are aliased to it so existing clients work without code changes.
+- A strict `bridge-*` model namespace mapping to the four real models the
+  ChatGPT-Pro Codex backend currently accepts: `bridge-gpt-5.5`,
+  `bridge-gpt-5.4`, `bridge-gpt-5.3-codex`, `bridge-gpt-5.2`. See
+  [Model aliases](#model-aliases) below.
+- Optional `--tunnel` mode that runs an ngrok tunnel so Cursor's cloud can
+  reach the bridge (Cursor BYOK proxies through Cursor's servers, not from
+  your editor — see [Cursor specifics](#cursor-specifics)), with bearer-token
+  auth on the public endpoint.
+- On-device Cursor settings sync: when tunnel mode is on the bridge writes
+  the current ngrok URL and the `bridge-*` model names into Cursor's settings
+  store so you don't have to add them manually.
 
 ## Prerequisites
 
@@ -110,7 +120,9 @@ codex-cursor-bridge [options]
   -p, --port <port>          Port to listen on (default: 7711)
       --host <host>          Bind address (default: 127.0.0.1)
   -a, --auth-path <path>     Codex auth file (default: ~/.codex/auth.json)
-  -m, --model <id>           Upstream model id (default: gpt-5.5)
+      --tunnel               Expose the bridge through ngrok so Cursor's
+                             cloud can reach it (required for Cursor BYOK)
+      --no-tunnel            Force localhost-only mode
       --setup                Re-run the first-run setup wizard
       --no-setup             Skip the wizard even on first run (for daemons)
   -h, --help                 Show help
@@ -126,6 +138,27 @@ port temporarily:
 ```bash
 npx codex-cursor-bridge --port 8088
 ```
+
+## Model aliases
+
+The bridge exposes a strict whitelist of model names — sending any other
+name (e.g. `gpt-4o`, `gpt-3.5-turbo`, plain `gpt-5.5`) gets a `400` with the
+supported list. The aliases are 1:1 with the four model names the
+ChatGPT-Pro Codex backend currently accepts:
+
+| Bridge alias            | Upstream model    | Notes                              |
+| ----------------------- | ----------------- | ---------------------------------- |
+| `bridge-gpt-5.5`        | `gpt-5.5`         | Cursor-safe synonym for gpt-5.5    |
+| `bridge-gpt-5.4`        | `gpt-5.4`         |                                    |
+| `bridge-gpt-5.3-codex`  | `gpt-5.3-codex`   | the Codex-tuned variant            |
+| `bridge-gpt-5.2`        | `gpt-5.2`         | smaller / cheaper                  |
+
+The `bridge-` prefix exists because Cursor's cloud has special handling
+for the bare name `gpt-5.5` — it's one of Cursor's branded SKUs and gets
+routed through their own servers regardless of your BYOK URL, bypassing
+this bridge entirely. Custom names that Cursor doesn't recognize (anything
+with the `bridge-` prefix) are forwarded to your BYOK URL normally. See
+[Cursor specifics](#cursor-specifics) for the full mechanics.
 
 ### Run it on login (macOS)
 
@@ -168,21 +201,69 @@ systemctl --user daemon-reload
 systemctl --user enable --now codex-cursor-bridge
 ```
 
-## Wire it into Cursor
+## Cursor specifics
 
-1. Open Cursor → `Cmd+,` → **Cursor Settings** → **Models** tab.
-2. Scroll to **OpenAI API Key**. Paste anything (e.g. `sk-bridge`). The proxy
-   does not validate it.
-3. Toggle **Override OpenAI Base URL** on. Set it to:
-   ```
-   http://127.0.0.1:7711/v1
-   ```
-4. Click **Verify**. It should succeed.
-5. In the model list, enable any OpenAI model (`gpt-4o` is a safe default).
-   All of them route to `gpt-5.5` under the hood.
+Cursor BYOK does **not** dial your base URL from the editor. The request is
+sent to Cursor's cloud, which then forwards it on to whatever URL you set.
+That has two consequences:
 
-> **Note:** Cursor's autonomous Composer agent uses Cursor's own models — BYOK
-> only feeds the chat panel and the manual model selector. This proxy
+- **A localhost base URL is unreachable.** Cursor's cloud cannot route to
+  `http://127.0.0.1:...` on your machine. You need a public URL — `--tunnel`
+  spins up an ngrok tunnel for exactly this.
+- **Cursor cherry-picks which model names go through BYOK.** Its branded
+  premium SKUs (`gpt-5.5`, the Composer family, Claude, etc.) bypass BYOK
+  and use Cursor's own routing — you'll see a "User Provided API Key Rate
+  Limit Exceeded" error if you try them. Custom model names that aren't on
+  Cursor's reserved list pass through to the BYOK URL normally. The
+  `bridge-*` aliases all dodge the reserved list.
+
+### One-time setup
+
+```bash
+# 1. install ngrok and authenticate it (free account is fine):
+brew install --cask ngrok       # or: https://ngrok.com/download
+ngrok config add-authtoken <YOUR_TOKEN>
+
+# 2. launch the bridge with the wizard — say YES to tunnel mode:
+npx codex-cursor-bridge --setup
+```
+
+The wizard will:
+
+1. Verify your Codex CLI auth.
+2. Start an ngrok tunnel, generate a `sk-bridge-<…>` bearer token, persist it.
+3. Patch your Cursor settings on-device: set the OpenAI base URL to the
+   tunnel URL and add the four `bridge-*` model aliases to Cursor's "Add
+   Model" list.
+4. Open Cursor and copy the tunnel URL to your clipboard.
+
+Then in Cursor:
+
+1. `Cmd+,` → **Cursor Settings** → **Models** tab.
+2. **OpenAI API Key**: paste the `sk-bridge-…` token from the startup card.
+   (We can't write secrets to Cursor's keychain — this is the one thing
+   that stays manual.)
+3. Click **Verify**.
+4. Pick `bridge-gpt-5.5` (or any other `bridge-*` alias) in the model picker.
+
+**If you fully quit and reopen Cursor after running the wizard**, the auto-
+configured settings show up. If Cursor was running while the wizard ran, it
+may overwrite our changes with its in-memory copy on next save — fully
+quit (`Cmd+Q`, not just close the window) and reopen.
+
+### Daily operation
+
+Each restart of the bridge spawns a new ngrok URL (free tier rotates the
+domain). The bridge auto-patches Cursor's settings with the new URL every
+time, so you don't have to touch the BYOK config again as long as Cursor
+isn't running when the bridge restarts.
+
+For a stable URL, configure an ngrok reserved domain (paid plan) or use a
+different tunneling provider (cloudflared, Tailscale Funnel — adapter would
+welcome a PR).
+
+> **Note:** Cursor's autonomous Composer agent uses Cursor's own models —
+> BYOK only feeds the chat panel and the manual model selector. This proxy
 > replaces the *OpenAI* bill, not Cursor's subscription.
 
 ## Configuration
@@ -195,10 +276,10 @@ which is also how the LaunchAgent / systemd unit set values:
 | `CODEX_BRIDGE_PORT`     | `--port`         | `7711`                          | TCP port to listen on                       |
 | `CODEX_BRIDGE_HOST`     | `--host`         | `127.0.0.1`                     | Bind address                                |
 | `CODEX_AUTH_PATH`       | `--auth-path`    | `~/.codex/auth.json`            | Path to the Codex auth file                 |
-| `CODEX_MODEL`           | `--model`        | `gpt-5.5`                       | Real upstream model                         |
 | `CODEX_CLIENT_VERSION`  | _(none)_         | `0.131.0`                       | `version` header sent upstream              |
 | `CODEX_ORIGINATOR`      | _(none)_         | `codex_cli_rs`                  | `originator` header sent upstream           |
 | `CODEX_CLIENT_ID`       | _(none)_         | `app_EMoamEEZ73f0CkXaXp7hrann`  | OAuth client_id used during token refresh   |
+| `CODEX_BRIDGE_DEBUG`    | _(none)_         | _unset_                         | Set to `1` to log incoming request bodies   |
 
 ## Endpoints
 
@@ -211,25 +292,37 @@ which is also how the LaunchAgent / systemd unit set values:
 
 ## How it works
 
-1. On each request, the proxy reads `~/.codex/auth.json` and pulls:
-   - `tokens.access_token` — a short-lived JWT whose `aud` is
-     `https://api.openai.com/v1` and whose claims include
-     `chatgpt_plan_type=pro`.
+1. **Model resolution.** Incoming `model` is checked against the
+   [`bridge-*` whitelist](#model-aliases). Unknown names get a `400`; known
+   ones are mapped to the upstream-accepted name (e.g. `bridge-gpt-5.4` →
+   `gpt-5.4`).
+2. **Auth lookup.** On each request the proxy reads `~/.codex/auth.json`:
+   - `tokens.access_token` — short-lived JWT, `chatgpt_plan_type=pro`/`plus`.
    - `tokens.account_id` — sent as `chatgpt-account-id` header.
-2. The request body is translated:
-   - `messages` → `input` (with `input_text` / `input_image` parts).
-   - `system` / `developer` messages → top-level `instructions`.
+3. **Body translation.**
+   - `messages` → `input` (with `input_text`/`input_image` parts).
+   - Cursor-style `input` arrays pass through.
+   - `system`/`developer` messages → top-level `instructions`.
    - `tools` → Responses-API-shaped function tools.
    - Tool call results (`role: "tool"`) → `function_call_output` items.
-3. The proxy POSTs to `https://chatgpt.com/backend-api/codex/responses` with
+   - `max_tokens`/`user` are dropped (upstream rejects them).
+4. **Forward.** `POST https://chatgpt.com/backend-api/codex/responses` with
    the Codex-flavoured headers (`originator`, `version`, `User-Agent`,
    `OpenAI-Beta: responses=experimental`).
-4. The SSE response is parsed and re-emitted as `chat.completion.chunk`
-   events, with `response.output_text.delta` → `delta.content` and
-   `response.function_call_arguments.delta` → `delta.tool_calls[].function.arguments`.
-5. If upstream returns `401`, the proxy refreshes the access token at
-   `https://auth.openai.com/oauth/token` using the stored `refresh_token`,
-   writes it back to `auth.json`, and retries once.
+5. **Response translation.** The upstream SSE stream is re-emitted as
+   `chat.completion.chunk` events
+   (`response.output_text.delta` → `delta.content`,
+   `response.function_call_arguments.delta` → `delta.tool_calls[].function.arguments`).
+6. **Refresh on 401.** Concurrent 401s are coalesced into a single OAuth
+   refresh against `auth.openai.com`; the new token is atomically written
+   back to `auth.json` with `0600`.
+7. **Tunnel + auth.** With `--tunnel`, an ngrok subprocess is spawned, the
+   public URL is read from ngrok's local admin API at `:4040`, and
+   `Authorization: Bearer <sk-bridge-…>` is required on `/v1/*`.
+8. **Cursor sync.** With tunnel mode on, the bridge writes the new ngrok URL
+   and the `bridge-*` model names into Cursor's settings DB at
+   `<appdata>/Cursor/User/globalStorage/state.vscdb` so the user doesn't have
+   to add them by hand on each restart.
 
 ## Use it from other clients
 
@@ -241,32 +334,40 @@ Anything that speaks OpenAI works:
 import OpenAI from 'openai';
 const client = new OpenAI({
   baseURL: 'http://127.0.0.1:7711/v1',
-  apiKey: 'sk-bridge', // ignored by the proxy
+  apiKey: 'sk-bridge', // any non-empty value when no --tunnel; else the generated token
 });
 const r = await client.chat.completions.create({
-  model: 'gpt-4o',
+  model: 'bridge-gpt-5.4',
   messages: [{ role: 'user', content: 'hi' }],
 });
 ```
 
 **Aider / Continue / Open Interpreter / etc.** — set their OpenAI base URL
-to `http://127.0.0.1:7711/v1` and any non-empty API key.
+to `http://127.0.0.1:7711/v1`, model to one of the `bridge-*` aliases, and
+API key to any non-empty value (or the bridge token when running with
+`--tunnel`).
 
 ## Limitations & known gotchas
 
-- **Only one real model.** The ChatGPT-subscription Codex backend only allows
-  `gpt-5.5`. No Claude, no o-series, no fine-tuned models.
-- **No quota dashboard.** ChatGPT Pro has soft Codex limits; exceed them and
-  upstream will return 429s. There is currently no programmatic way to
-  inspect remaining quota.
-- **Cursor's agent.** Cursor's Composer agent uses Cursor's own models, not
-  BYOK. The bridge only powers chat / manual model selection.
-- **Single user, localhost.** The proxy binds to `127.0.0.1` by default. Do
-  not expose it to a network — anyone who can reach the port can spend your
-  ChatGPT quota.
-- **Token expiry.** The access token typically lasts ~10 days. Refresh is
-  automatic, but if the refresh token itself ever expires you'll need to run
-  `codex login` again.
+- **Four models only.** The ChatGPT-subscription Codex backend currently
+  accepts `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.2`. No Claude, no
+  o-series, no fine-tuned models. Use the `bridge-*` aliases.
+- **No quota dashboard.** ChatGPT Pro has soft Codex limits; exceed them
+  and upstream will return 429s. There's no programmatic way to inspect
+  remaining quota.
+- **Cursor's agent.** Cursor's Composer agent uses Cursor's own models —
+  BYOK only feeds the chat panel and the manual model selector.
+- **Cursor BYOK URL ≠ localhost.** Cursor's cloud forwards BYOK calls, so
+  the bridge needs a public URL (see `--tunnel`). The free ngrok tier
+  rotates the URL each restart.
+- **Cursor reserves the bare `gpt-5.5` name.** Use `bridge-gpt-5.5`
+  instead.
+- **Public exposure with `--tunnel`.** Anyone who learns both the ngrok URL
+  and the bridge token can spend your quota. The bridge generates a random
+  per-install token, but treat the pair as sensitive.
+- **Token expiry.** The Codex access token typically lasts ~10 days.
+  Refresh is automatic against `auth.openai.com`; if the refresh token
+  itself expires, run `codex login`.
 
 ## Terms of service
 

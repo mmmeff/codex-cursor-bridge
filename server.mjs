@@ -29,6 +29,7 @@ import {
   openCursor,
 } from './lib/setup.mjs';
 import { startNgrokTunnel } from './lib/tunnel.mjs';
+import { applyCursorConfig, isCursorRunning, cursorStateDbExists } from './lib/cursor-config.mjs';
 
 const PKG_VERSION = await loadPackageVersion();
 
@@ -51,43 +52,40 @@ const CLIENT_ID = process.env.CODEX_CLIENT_ID || 'app_EMoamEEZ73f0CkXaXp7hrann';
 const CLIENT_VERSION = process.env.CODEX_CLIENT_VERSION || '0.131.0';
 const ORIGINATOR = process.env.CODEX_ORIGINATOR || 'codex_cli_rs';
 
-// Models the ChatGPT-plan Codex backend actually accepts (probed empirically).
-// Requests using one of these names are forwarded verbatim so the user gets
-// the model they asked for. Anything else gets rewritten to DEFAULT_MODEL,
-// which is what e.g. `bridge-gpt-5.5` and the legacy gpt-4o-style aliases
-// rely on.
-const ACCEPTED_UPSTREAM_MODELS = new Set(['gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex', 'gpt-5.2']);
-const DEFAULT_MODEL = args.model ?? process.env.CODEX_MODEL ?? 'gpt-5.5';
-// Returns the model name to actually send upstream. If the caller asked for
-// something the backend won't accept, fall back to DEFAULT_MODEL.
+// The bridge namespace. Every supported client-facing model uses the
+// `bridge-` prefix and maps to one of the four models the ChatGPT-Pro Codex
+// backend currently accepts. The prefix exists because Cursor's cloud
+// hijacks raw OpenAI-flavored names like `gpt-5.5` and routes them around
+// BYOK; the bridge-prefixed aliases pass cleanly through.
+//
+// Unknown model names are REJECTED with 400 instead of silently rewritten
+// (clients sending `gpt-4o` etc. were getting back gpt-5.5 outputs without
+// realizing it).
+const BRIDGE_MODEL_MAP = {
+  'bridge-gpt-5.5': 'gpt-5.5',
+  'bridge-gpt-5.4': 'gpt-5.4',
+  'bridge-gpt-5.3-codex': 'gpt-5.3-codex',
+  'bridge-gpt-5.2': 'gpt-5.2',
+};
+const BRIDGE_MODELS = Object.keys(BRIDGE_MODEL_MAP);
+
+// Returns the upstream model id for a client-facing alias, or null if the
+// caller sent something we don't support. Callers should respond 400 on null.
 function resolveUpstreamModel(requested) {
-  if (requested && ACCEPTED_UPSTREAM_MODELS.has(requested)) return requested;
-  return DEFAULT_MODEL;
+  if (typeof requested !== 'string') return null;
+  return BRIDGE_MODEL_MAP[requested] ?? null;
 }
 
-// Aliases advertised on /v1/models.
-//
-// Real ChatGPT-Pro models that pass through verbatim:
-//   gpt-5.4, gpt-5.3-codex, gpt-5.2 — work in Cursor BYOK (not hijacked).
-//   gpt-5.5 — works for non-Cursor callers (Aider/Continue/SDK), but Cursor
-//             treats it as one of its own managed models and routes around
-//             BYOK. Use `bridge-gpt-5.5` from Cursor to actually reach it.
-//
-// Pure aliases (rewritten upstream to DEFAULT_MODEL):
-//   bridge-gpt-5.5 — Cursor-safe synonym for gpt-5.5.
-//   gpt-4o, gpt-4, gpt-4-turbo, gpt-4o-mini — backwards-compat for clients
-//     that hard-code these names; you still get DEFAULT_MODEL upstream.
-const MODEL_ALIASES = [
-  'bridge-gpt-5.5',
-  'gpt-5.5',
-  'gpt-5.4',
-  'gpt-5.3-codex',
-  'gpt-5.2',
-  'gpt-4o',
-  'gpt-4',
-  'gpt-4-turbo',
-  'gpt-4o-mini',
-];
+function unsupportedModelMessage(requested) {
+  const prefix =
+    requested == null || requested === ''
+      ? 'missing required "model" field'
+      : `unsupported model "${requested}"`;
+  return (
+    `${prefix}. Supported aliases: ${BRIDGE_MODELS.join(', ')}. ` +
+    `See https://github.com/mmmeff/codex-cursor-bridge#model-aliases for why bridge-* is required.`
+  );
+}
 
 const UA = `${ORIGINATOR}/${CLIENT_VERSION} (${platformLabel()}) bridge`;
 
@@ -104,7 +102,7 @@ if (wizardRanThisInvocation) {
     port: PORT,
     host: HOST,
     authPath: AUTH_PATH,
-    model: DEFAULT_MODEL,
+    bridgeModels: BRIDGE_MODELS,
     version: PKG_VERSION,
     repoDir: repoDirOf(import.meta.url),
   });
@@ -146,18 +144,41 @@ printStartupCard({
   port: PORT,
   host: HOST,
   authPath: AUTH_PATH,
-  model: DEFAULT_MODEL,
+  bridgeModels: BRIDGE_MODELS,
   version: PKG_VERSION,
   publicUrl: tunnel?.url,
   authToken: AUTH_TOKEN,
 });
 
-// Right after the wizard, if tunnel mode was just enabled, do the side
-// effects we promised: copy the public URL to clipboard, open Cursor, so the
-// user can paste-and-go.
+// When tunnel mode is on, sync Cursor's on-device settings store so the user
+// doesn't have to re-paste a fresh ngrok URL or add each bridge-* model by
+// hand. Best-effort — failures are logged but never fatal.
+if (tunnel?.url && cursorStateDbExists()) {
+  const baseUrl = `${tunnel.url}/v1`;
+  const result = applyCursorConfig({
+    openAIBaseUrl: baseUrl,
+    addUserAddedModels: BRIDGE_MODELS,
+  });
+  if (result.ok && result.changes.length) {
+    process.stdout.write(`\nUpdated Cursor settings: ${result.changes.join(' · ')}\n`);
+    if (isCursorRunning()) {
+      process.stdout.write(
+        'Cursor is running — fully quit and reopen Cursor (Cmd+Q, then relaunch) so it picks up the new settings.\n',
+      );
+    }
+  } else if (result.ok) {
+    process.stdout.write('\nCursor settings already up to date.\n');
+  } else {
+    process.stdout.write(`\nCould not auto-update Cursor settings: ${result.reason}\n`);
+    process.stdout.write('Configure manually using the BYOK card above.\n');
+  }
+}
+
+// Right after the wizard, if tunnel mode was just enabled, do the human
+// nudges: copy the public URL to clipboard, open Cursor.
 if (wizardRanThisInvocation && tunnel?.url) {
   if (copyToClipboard(tunnel.url)) {
-    process.stdout.write(`\nCopied ${tunnel.url} to clipboard.\n`);
+    process.stdout.write(`Copied ${tunnel.url} to clipboard.\n`);
   }
   if (openCursor()) {
     process.stdout.write('Opened Cursor.\n');
@@ -331,7 +352,7 @@ function upstreamHeaders(auth) {
 
 // ---------- chat/completions <-> responses translators ----------
 
-function chatToResponses(req) {
+function chatToResponses(req, upstreamModel) {
   const messages = Array.isArray(req.messages) ? req.messages : [];
   const sys = [];
   const input = [];
@@ -381,7 +402,7 @@ function chatToResponses(req) {
     });
   }
   const out = {
-    model: resolveUpstreamModel(req.model),
+    model: upstreamModel,
     instructions: sys.length ? sys.join('\n\n') : 'You are a helpful assistant.',
     input,
     stream: true,
@@ -415,7 +436,7 @@ function stringOf(c) {
 //   - Function-call and function-call-output items pass through.
 //   - Tools, tool_choice, temperature, top_p, parallel_tool_calls, user are
 //     forwarded as-is. max_tokens et al. are still stripped (upstream rejects).
-function responsesShapeToUpstream(body) {
+function responsesShapeToUpstream(body, upstreamModel) {
   const items = Array.isArray(body.input) ? body.input : [];
   const sys = [];
   const out = [];
@@ -432,7 +453,7 @@ function responsesShapeToUpstream(body) {
     out.push(it);
   }
   const upstream = {
-    model: resolveUpstreamModel(body.model),
+    model: upstreamModel,
     instructions:
       typeof body.instructions === 'string' && body.instructions.length
         ? body.instructions + (sys.length ? '\n\n' + sys.join('\n\n') : '')
@@ -532,14 +553,23 @@ async function handleChatCompletions(req, res) {
     );
   }
   const wantStream = body.stream !== false; // default to streaming
+  // Reject unknown models with a clear 400 — the bridge namespace is a
+  // strict whitelist, no silent rewrites.
+  const upstreamModel = resolveUpstreamModel(body.model);
+  if (!upstreamModel) {
+    respondError(res, 400, unsupportedModelMessage(body.model));
+    return;
+  }
   // Cursor (and likely future OpenAI SDKs) sends a Responses-API-shaped body
   // — an `input` array of role/content items, no top-level `messages` — to
   // the chat/completions URL. Detect that shape and route it without
   // re-translating from messages we don't have.
   const isResponsesShape = Array.isArray(body.input) && !Array.isArray(body.messages);
-  const upstreamBody = isResponsesShape ? responsesShapeToUpstream(body) : chatToResponses(body);
+  const upstreamBody = isResponsesShape
+    ? responsesShapeToUpstream(body, upstreamModel)
+    : chatToResponses(body, upstreamModel);
   upstreamBody.stream = true;
-  const requestedModel = body.model || DEFAULT_MODEL;
+  const requestedModel = body.model;
   const msgCount = isResponsesShape
     ? body.input.length
     : Array.isArray(body.messages)
@@ -566,12 +596,12 @@ async function handleChatCompletions(req, res) {
 
   if (!up.ok || !up.body) {
     const text = await up.text().catch(() => '');
-    // Always log upstream errors with the body we forwarded — invaluable when
-    // a downstream client sends a shape we don't translate cleanly.
-    process.stdout.write(
-      `${tint('dim', nowHMS())} ${tint('red', `upstream ${up.status}`)} forwarded body: ${JSON.stringify(upstreamBody).slice(0, 600)}\n`,
-    );
-    process.stdout.write(`${tint('dim', '   upstream said:')} ${text.slice(0, 500)}\n`);
+    if (process.env.CODEX_BRIDGE_DEBUG) {
+      process.stdout.write(
+        `${tint('dim', nowHMS())} ${tint('red', `upstream ${up.status}`)} forwarded body: ${JSON.stringify(upstreamBody).slice(0, 600)}\n`,
+      );
+      process.stdout.write(`${tint('dim', '   upstream said:')} ${text.slice(0, 500)}\n`);
+    }
     respondError(res, up.status || 500, text || 'upstream error');
     return;
   }
@@ -699,7 +729,12 @@ async function handleResponsesPassthrough(req, res) {
       `${tint('dim', nowHMS())} ${tint('magenta', 'DEBUG /v1/responses in:')} ${JSON.stringify(body).slice(0, 800)}\n`,
     );
   }
-  body.model = resolveUpstreamModel(body.model);
+  const upstreamModel = resolveUpstreamModel(body.model);
+  if (!upstreamModel) {
+    respondError(res, 400, unsupportedModelMessage(body.model));
+    return;
+  }
+  body.model = upstreamModel;
   if (!body.instructions) body.instructions = 'You are a helpful assistant.';
   body.stream = true;
   let up;
@@ -711,10 +746,12 @@ async function handleResponsesPassthrough(req, res) {
   }
   if (!up.ok || !up.body) {
     const t = await up.text().catch(() => '');
-    process.stdout.write(
-      `${tint('dim', nowHMS())} ${tint('red', `upstream ${up.status}`)} forwarded body: ${JSON.stringify(body).slice(0, 600)}\n`,
-    );
-    process.stdout.write(`${tint('dim', '   upstream said:')} ${t.slice(0, 500)}\n`);
+    if (process.env.CODEX_BRIDGE_DEBUG) {
+      process.stdout.write(
+        `${tint('dim', nowHMS())} ${tint('red', `upstream ${up.status}`)} forwarded body: ${JSON.stringify(body).slice(0, 600)}\n`,
+      );
+      process.stdout.write(`${tint('dim', '   upstream said:')} ${t.slice(0, 500)}\n`);
+    }
     respondError(res, up.status || 500, t);
     return;
   }
@@ -736,11 +773,11 @@ function modelsResponse() {
   const now = Math.floor(Date.now() / 1000);
   return {
     object: 'list',
-    data: MODEL_ALIASES.map((id) => ({
+    data: BRIDGE_MODELS.map((id) => ({
       id,
       object: 'model',
       created: now,
-      owned_by: 'openai-chatgpt-subscription',
+      owned_by: 'codex-cursor-bridge',
     })),
   };
 }
