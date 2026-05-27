@@ -4,6 +4,40 @@
 > OpenAI-API-compatible tool), instead of paying separately for OpenAI API
 > credits.
 
+[![npm](https://img.shields.io/npm/v/codex-cursor-bridge)](https://www.npmjs.com/package/codex-cursor-bridge)
+
+## Quick start
+
+Need: a **ChatGPT Pro/Plus** plan, **Node 22.5+**, and the
+[Codex CLI](https://github.com/openai/codex) signed in.
+
+```bash
+codex login              # if you haven't already — writes ~/.codex/auth.json
+npx codex-cursor-bridge
+```
+
+That's the whole thing for **Aider / Continue / Cline / the OpenAI SDK** —
+point them at `http://127.0.0.1:7711/v1`, use any non-empty API key, and
+pick a [`bridge-*` model](#model-aliases) (e.g. `bridge-pro-high`).
+
+**Using Cursor?** One extra step. Cursor's BYOK calls come from Cursor's
+*cloud*, not your editor, so the bridge needs a public URL. Install
+[ngrok](https://ngrok.com/download) (free tier is fine), then run the
+guided setup — it opens a tunnel, generates an auth token, and
+auto-configures Cursor for you:
+
+```bash
+npx codex-cursor-bridge --setup
+```
+
+Then paste the printed token into Cursor → Settings → Models → OpenAI API
+Key and pick a `bridge-*` model. Full walkthrough:
+[Cursor specifics](#cursor-specifics).
+
+---
+
+## What it is
+
 A small zero-npm-dependency Node CLI. It accepts OpenAI-style
 `/v1/chat/completions` requests on `localhost`, translates them to the
 **Responses API**, and forwards them to the same backend the official
@@ -57,12 +91,6 @@ API.
   card that shows the exact alias → upstream-model mapping plus the
   fields to paste into Cursor.
 
-## Status
-
-Published on npm as
-[`codex-cursor-bridge`](https://www.npmjs.com/package/codex-cursor-bridge).
-First public release is v1.0.0.
-
 ## Prerequisites
 
 1. **A ChatGPT Pro or Plus subscription.** Free accounts won't work — the
@@ -87,15 +115,10 @@ test -f ~/.codex/auth.json && echo "auth present" || echo "run: codex login"
 command -v ngrok >/dev/null && ngrok config check       # only for Cursor
 ```
 
-## Quick start
+## First run & the setup wizard
 
-If you've already run `codex login`, this is the whole thing:
-
-```bash
-npx codex-cursor-bridge
-```
-
-The **first** time you run it you'll see an interactive setup wizard that:
+The **first** time you run `npx codex-cursor-bridge` you get an interactive
+setup wizard that:
 
 1. Checks prerequisites — Node version, the Codex CLI, `~/.codex/auth.json`,
    your ChatGPT plan, and a live upstream probe.
